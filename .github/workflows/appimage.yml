@@ -1,0 +1,230 @@
+name: Build lean AppImage
+
+on:
+  workflow_dispatch:
+  push:
+    tags:
+      - "v*"
+  release:
+    types: [published]
+
+permissions:
+  contents: write
+
+jobs:
+  appimage:
+    name: Build Qt6 lean AppImage
+    runs-on: ubuntu-24.04
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install build and packaging dependencies
+        shell: bash
+        run: |
+          set -euxo pipefail
+          sudo apt-get update
+
+          base_packages=(
+            build-essential
+            cmake
+            desktop-file-utils
+            extra-cmake-modules
+            file
+            gettext
+            libx11-dev
+            patchelf
+            wget
+            xvfb
+            zsync
+          )
+
+          kde_qt6_packages=(
+            kwayland-dev
+            libkdecorations3-dev
+            libkf6colorscheme-dev
+            libkf6config-dev
+            libkf6configwidgets-dev
+            libkf6coreaddons-dev
+            libkf6frameworkintegration-dev
+            libkf6guiaddons-dev
+            libkf6i18n-dev
+            libkf6iconthemes-dev
+            libkf6kcmutils-dev
+            libkf6kirigami2-dev
+            libkf6package-dev
+            libkf6service-dev
+            libkf6windowsystem-dev
+            qt6-base-dev
+            qt6-declarative-dev
+            qt6-svg-dev
+          )
+
+          available_kde_qt6_packages=()
+          for package_name in "${kde_qt6_packages[@]}"; do
+            if apt-cache show "${package_name}" >/dev/null 2>&1; then
+              available_kde_qt6_packages+=("${package_name}")
+            else
+              echo "::warning::Package not available on runner image: ${package_name}"
+            fi
+          done
+
+          sudo apt-get install -y --no-install-recommends \
+            "${base_packages[@]}" \
+            "${available_kde_qt6_packages[@]}"
+
+      - name: Download appimagetool
+        shell: bash
+        run: |
+          set -euxo pipefail
+          wget -q https://github.com/AppImage/AppImageKit/releases/download/continuous/appimagetool-x86_64.AppImage
+          chmod +x appimagetool-x86_64.AppImage
+          ./appimagetool-x86_64.AppImage --appimage-extract >/dev/null
+          echo "${GITHUB_WORKSPACE}/squashfs-root/usr/bin" >> "${GITHUB_PATH}"
+
+      - name: Configure and build (Qt6 only)
+        shell: bash
+        run: |
+          set -euxo pipefail
+          cmake -S . -B build \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_INSTALL_PREFIX=/usr \
+            -DBUILD_TESTING=OFF \
+            -DBUILD_QT5=OFF \
+            -DBUILD_QT6=ON
+          cmake --build build --parallel
+
+      - name: Stage install tree to AppDir
+        shell: bash
+        run: |
+          set -euxo pipefail
+          rm -rf AppDir
+          DESTDIR="${GITHUB_WORKSPACE}/AppDir" cmake --install build
+
+      - name: Validate install manifest against staged AppDir
+        shell: bash
+        run: |
+          set -euo pipefail
+          manifest_file="${GITHUB_WORKSPACE}/build/install_manifest.txt"
+          if [ ! -f "${manifest_file}" ]; then
+            echo "::error::Missing install manifest at ${manifest_file}"
+            exit 1
+          fi
+
+          missing=0
+          while IFS= read -r install_path; do
+            if [ -n "${install_path}" ] && [ ! -e "${GITHUB_WORKSPACE}/AppDir${install_path}" ]; then
+              echo "::error::Installed path from manifest not found in AppDir: ${install_path}"
+              missing=1
+            fi
+          done < "${manifest_file}"
+
+          if [ "${missing}" -ne 0 ]; then
+            exit 1
+          fi
+
+      - name: Prepare AppDir metadata
+        shell: bash
+        run: |
+          set -euxo pipefail
+          desktop_file="${GITHUB_WORKSPACE}/AppDir/usr/share/applications/klassy-settings.desktop"
+          if [ ! -f "${desktop_file}" ]; then
+            echo "::error::Desktop entry not found: ${desktop_file}"
+            exit 1
+          fi
+
+          cat > "${GITHUB_WORKSPACE}/AppDir/AppRun" <<'EOF'
+          #!/usr/bin/env bash
+          set -euo pipefail
+          HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+          export PATH="${HERE}/usr/bin:${PATH}"
+          export XDG_DATA_DIRS="${HERE}/usr/share:${XDG_DATA_DIRS:-/usr/local/share:/usr/share}"
+          exec "${HERE}/usr/bin/klassy-settings" "$@"
+          EOF
+          chmod +x "${GITHUB_WORKSPACE}/AppDir/AppRun"
+
+          cp "${desktop_file}" "${GITHUB_WORKSPACE}/AppDir/klassy-settings.desktop"
+
+          appdir_icon=""
+          if appdir_icon="$(find "${GITHUB_WORKSPACE}/AppDir/usr/share/icons" -type f \( -name "klassy-settings.*" -o -name "sc-apps-klassy-settings.*" \) | head -n 1)"; then
+            :
+          fi
+          if [ -z "${appdir_icon}" ]; then
+            echo "::error::Could not locate a Klassy Settings icon in AppDir"
+            exit 1
+          fi
+          cp "${appdir_icon}" "${GITHUB_WORKSPACE}/AppDir/.DirIcon"
+
+      - name: Enforce lean AppImage shared library policy
+        shell: bash
+        run: |
+          set -euo pipefail
+          bad=0
+          while IFS= read -r so_file; do
+            so_basename="$(basename "${so_file}")"
+            case "${so_basename}" in
+              libklassycommon*.so*|klassy*.so|org.kde.klassy*.so|kcm_klassydecoration*.so|klassystyleconfig*.so)
+                ;;
+              *)
+                echo "::error::Unexpected shared library bundled in AppDir: ${so_file}"
+                bad=1
+                ;;
+            esac
+          done < <(find "${GITHUB_WORKSPACE}/AppDir/usr" -type f \( -name "*.so" -o -name "*.so.*" \) | sort)
+
+          forbidden_patterns='/(libQt|libKF|libstdc\+\+|libgcc_s|libc\.so|libm\.so|libpthread\.so|libdl\.so|ld-linux)'
+          if find "${GITHUB_WORKSPACE}/AppDir/usr" -type f | grep -E "${forbidden_patterns}" >/dev/null 2>&1; then
+            echo "::error::Forbidden non-project runtime libraries were found in AppDir."
+            find "${GITHUB_WORKSPACE}/AppDir/usr" -type f | grep -E "${forbidden_patterns}" || true
+            bad=1
+          fi
+
+          if [ "${bad}" -ne 0 ]; then
+            exit 1
+          fi
+
+      - name: Build lean AppImage
+        shell: bash
+        run: |
+          set -euxo pipefail
+          version="${GITHUB_REF_NAME:-dev}"
+          appimage_name="Klassy-${version}-x86_64-lean-kde-host.AppImage"
+          ARCH=x86_64 appimagetool --no-appstream "${GITHUB_WORKSPACE}/AppDir" "${appimage_name}"
+          echo "APPIMAGE_NAME=${appimage_name}" >> "${GITHUB_ENV}"
+
+      - name: Smoke test AppImage on KDE-capable host runtime
+        shell: bash
+        run: |
+          set -euxo pipefail
+          "./${APPIMAGE_NAME}" --appimage-extract >/dev/null
+
+          if [ ! -x "${GITHUB_WORKSPACE}/squashfs-root/usr/bin/klassy-settings" ]; then
+            echo "::error::klassy-settings binary missing from AppImage"
+            exit 1
+          fi
+
+          ldd "${GITHUB_WORKSPACE}/squashfs-root/usr/bin/klassy-settings" | tee "${GITHUB_WORKSPACE}/ldd-klassy-settings.txt"
+          if grep -q "not found" "${GITHUB_WORKSPACE}/ldd-klassy-settings.txt"; then
+            echo "::error::Host KDE/Qt runtime dependencies are unresolved in smoke test."
+            exit 1
+          fi
+
+          mkdir -p "${GITHUB_WORKSPACE}/runtime-dir"
+          chmod 700 "${GITHUB_WORKSPACE}/runtime-dir"
+          QT_QPA_PLATFORM=offscreen XDG_RUNTIME_DIR="${GITHUB_WORKSPACE}/runtime-dir" "${GITHUB_WORKSPACE}/squashfs-root/AppRun" --help >/dev/null
+
+          test -n "$(find "${GITHUB_WORKSPACE}/squashfs-root/usr" -type f \( -name 'klassy6.so' -o -name 'org.kde.klassy.so' \) | head -n 1)"
+
+      - name: Upload AppImage artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.APPIMAGE_NAME }}
+          path: ${{ github.workspace }}/${{ env.APPIMAGE_NAME }}
+          if-no-files-found: error
+
+      - name: Attach AppImage to release
+        if: startsWith(github.ref, 'refs/tags/') || github.event_name == 'release'
+        uses: softprops/action-gh-release@v2
+        with:
+          files: ${{ github.workspace }}/${{ env.APPIMAGE_NAME }}
