@@ -113,6 +113,11 @@ Raw .rpm, .deb etc. binary packages are also available from the Open Build Servi
 &nbsp;
 &nbsp;
 
+### CI AppImage builds
+GitHub CI can produce a **lean AppImage** artifact for release tags. This AppImage intentionally contains only Klassy-installed files and metadata and does **not** bundle KDE Frameworks, Qt, or base system runtime libraries.
+
+This means the AppImage is **not fully self-contained**: it requires a KDE Plasma/KF6-capable host system with the necessary runtime libraries already installed.
+
 <a name="compile"/>
 
 ### Compile from source
