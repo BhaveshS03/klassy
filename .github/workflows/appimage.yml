@@ -63,7 +63,8 @@ jobs:
 
           available_kde_qt6_packages=()
           for package_name in "${kde_qt6_packages[@]}"; do
-            if apt-cache show "${package_name}" >/dev/null 2>&1; then
+            candidate_version="$(apt-cache policy "${package_name}" | awk '/Candidate:/ {print $2; exit}')"
+            if [ -n "${candidate_version}" ] && [ "${candidate_version}" != "(none)" ]; then
               available_kde_qt6_packages+=("${package_name}")
             else
               echo "::warning::Package not available on runner image: ${package_name}"
